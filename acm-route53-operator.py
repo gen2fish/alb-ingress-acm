@@ -115,7 +115,8 @@ def find_hosted_zone_id(domain_name):
     return zones[matching_zone]
 
 
-@kopf.on.create("ingresses")
+@kopf.on.update("ingresses", annotations={ACM_ANNOTATION: kopf.PRESENT, "alb.ingress.kubernetes.io/certificate-arn": kopf.ABSENT})
+@kopf.on.create("ingresses", annotations={ACM_ANNOTATION: kopf.PRESENT, "alb.ingress.kubernetes.io/certificate-arn": kopf.ABSENT})
 def ingress_created(body, **kwargs):
     print(body)
     ingress = body["metadata"]
@@ -124,35 +125,30 @@ def ingress_created(body, **kwargs):
     uid = ingress["uid"]
     annotations = ingress.get("annotations", {})
 
-    if annotations.get(ACM_ANNOTATION) == "true":
-        if annotations.get("alb.ingress.kubernetes.io/certificate-arn"):
-            print(f"Ingress {ingress_name} has existing certificate")
-            return
+    domain = body["spec"]["rules"][0]["host"]
+    print(f"Ingress {ingress_name} has domain {domain}, processing")
+    hosted_zone_id = find_hosted_zone_id(domain)
+    certificate_arn = create_acm_certificate(domain, ingress_name, namespace, uid)
+    create_route53_validation_records(certificate_arn, hosted_zone_id)
 
-        domain = body["spec"]["rules"][0]["host"]
-        print(f"Ingress {ingress_name} has domain {domain}, processing")
-        hosted_zone_id = find_hosted_zone_id(domain)
-        certificate_arn = create_acm_certificate(domain, ingress_name, namespace, uid)
-        create_route53_validation_records(certificate_arn, hosted_zone_id)
-
-        patch = {
-            "metadata": {
-                "annotations": {
-                    "alb.ingress.kubernetes.io/certificate-arn": certificate_arn,
-                    "aws.route53.kubernetes.io/hosted-zone": hosted_zone_id,
-                }
+    patch = {
+        "metadata": {
+            "annotations": {
+                "alb.ingress.kubernetes.io/certificate-arn": certificate_arn,
+                "aws.route53.kubernetes.io/hosted-zone": hosted_zone_id,
             }
         }
+    }
 
-        k8s_client.patch_namespaced_ingress(
-            name=ingress_name,
-            namespace=namespace,
-            body=patch,
-        )
+    k8s_client.patch_namespaced_ingress(
+        name=ingress_name,
+        namespace=namespace,
+        body=patch,
+    )
 
-        print(
-            f"Ingress {ingress_name} has been processed with ACM certificate {certificate_arn}"
-        )
+    print(
+        f"Ingress {ingress_name} has been processed with ACM certificate {certificate_arn}"
+    )
 
 
 def delete_acm_certificate(certificate_arn):
@@ -186,28 +182,22 @@ def delete_route53_validation_records(certificate_arn, hosted_zone_id):
         )
 
 
-@kopf.on.delete("ingresses")
+@kopf.on.delete("ingresses", annotations={ACM_ANNOTATION: kopf.PRESENT, "alb.ingress.kubernetes.io/certificate-arn": kopf.PRESENT})
 def ingress_deleted(body, **kwargs):
     ingress = body["metadata"]
     ingress_name = ingress["name"]
     namespace = ingress["namespace"]
     annotations = ingress.get("annotations", {})
+    certificate_arn = annotations.get("alb.ingress.kubernetes.io/certificate-arn")
+    hosted_zone_id = annotations.get("aws.route53.kubernetes.io/hosted-zone")
+    domain_name = body["spec"]["rules"][0]["host"]
+
+    print(f"Ingress {ingress_name} deleting, removing validation records")
+    delete_route53_validation_records(certificate_arn, hosted_zone_id)
 
     print(f"Ingress {ingress_name} deleting, removing AWS certificates")
-    if annotations.get(ACM_ANNOTATION) == "true":
+    delete_acm_certificate(certificate_arn)
 
-        certificate_arn = annotations.get("alb.ingress.kubernetes.io/certificate-arn")
-        hosted_zone_id = annotations.get("aws.route53.kubernetes.io/hosted-zone")
-
-        if certificate_arn:
-            domain_name = body["spec"]["rules"][0]["host"]
-
-            delete_route53_validation_records(certificate_arn, hosted_zone_id)
-            delete_acm_certificate(certificate_arn)
-
-            kopf.info(
-                body, reason="Delete", message=f"Certificate {certificate_arn} deleted"
-            )
 
 
 if __name__ == "__main__":
